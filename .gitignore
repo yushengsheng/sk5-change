@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+build/
+dist/
+release/
+*.spec.bak
+
+browser_profile/
+run_results.log
+launcher_debug.log
+startup_runtime.log
+startup_error.log
+ip_exchange_config.json
+
+regression_*.json
+test_config_tmp*.json
