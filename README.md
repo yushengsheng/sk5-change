@@ -98,15 +98,35 @@ python -m playwright install chromium
 
 如果电脑已经安装 Edge 或 Chrome，通常第二条可以不执行；程序会优先尝试调用本机 Edge/Chrome。
 
+## 打包发布
+
+生成文件夹版免安装包：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build_release.ps1 -Version v1.1.0
+```
+
+生成两个单文件 exe：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build_exe_release.ps1 -Version v1.1.0
+```
+
+`full` 版内置 Playwright Chromium，体积大但最稳；`lite` 版不内置 Chromium，只依赖 Windows 自带 Edge 或本机 Chrome，体积小。
+
 ## 登录
 
-第一次使用先点“打开/登录网站”，在弹出的浏览器里登录网站。
+第一次使用先点“更新当前登录态”，在弹出的浏览器里登录网站。
 
-登录态会保存在当前目录的 `browser_profile` 文件夹中，之后点击“随机调换”或“调换+测试”会直接在后台处理，不会打开网页窗口。
+登录态会保存在当前目录的账号 profile 文件夹中；旧版本登录态会继续使用 `browser_profile`，新增账号会保存在 `account_profiles`。之后点击“随机调换”或“调换+测试”会直接在后台处理，不会打开网页窗口。
+
+程序支持保存多个账号的登录状态。需要登录第二个账号时，点击“新增账号登录”，填写账号名称并在弹出的浏览器里登录；之后可以在“当前使用账号”下拉框中选择本次调换使用的账号。
+
+已保存账号可以在界面里重命名或删除。删除账号会删除该账号对应的登录状态和浏览器缓存，不会影响其他账号。
 
 ## 后台更换
 
-程序固定使用后台接口模式，调用该网页前端使用的 `/node/orderDetail` 和 `/node/exchangeRandom` 接口。批量调换时不弹浏览器页面；如果登录态失效，会提示先点“首次登录/更新登录态”。
+程序固定使用后台接口模式，调用该网页前端使用的 `/node/orderDetail` 和 `/node/exchangeRandom` 接口。批量调换时不弹浏览器页面；如果当前账号登录态失效，会提示先点“更新当前登录态”或“新增账号登录”。
 
 测速使用 Windows 自带的 `curl.exe`。程序会依次尝试多种 SOCKS5 连接方式，包括 `socks5h://用户名:密码@ip:端口`、`--socks5-hostname + --proxy-user`、`socks5://...`，避免某一种底层写法不兼容导致全部误判为不连通。
 

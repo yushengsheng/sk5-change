@@ -10,13 +10,14 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, urlparse
 
 import tkinter as tk
-from tkinter import messagebox, scrolledtext, ttk
+from tkinter import messagebox, scrolledtext, simpledialog, ttk
 
 SITE_BUY_URL = "http://www.gzsk5.com/#/buymain?cid=24"
 SITE_ORDER_URL = "http://www.gzsk5.com/#/orderdetail"
@@ -37,14 +38,22 @@ def get_app_dir() -> Path:
 
 
 APP_DIR = get_app_dir()
-PROFILE_DIR = APP_DIR / "browser_profile"
+LEGACY_PROFILE_DIR = APP_DIR / "browser_profile"
+PROFILE_DIR = LEGACY_PROFILE_DIR
+ACCOUNT_PROFILE_ROOT = APP_DIR / "account_profiles"
+ACCOUNTS_FILE = APP_DIR / "ip_exchange_accounts.json"
 RUN_LOG_FILE = APP_DIR / "run_results.log"
 CONFIG_FILE = APP_DIR / "ip_exchange_config.json"
 
 if getattr(sys, "frozen", False):
-    bundled_browsers = APP_DIR / "ms-playwright"
-    if bundled_browsers.exists():
-        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(bundled_browsers))
+    bundled_browser_candidates = [
+        APP_DIR / "ms-playwright",
+        Path(getattr(sys, "_MEIPASS", "")) / "ms-playwright",
+    ]
+    for bundled_browsers in bundled_browser_candidates:
+        if bundled_browsers.exists():
+            os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(bundled_browsers))
+            break
 
 
 @dataclass
@@ -94,12 +103,58 @@ class ProxyWorkItem:
     changes: int = 0
 
 
+@dataclass
+class AccountProfile:
+    id: str
+    name: str
+    profile_subdir: str
+    created_at: str
+    updated_at: str
+    last_used_at: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AccountProfile | None":
+        account_id = str(data.get("id") or "").strip()
+        name = str(data.get("name") or "").strip()
+        profile_subdir = str(data.get("profile_subdir") or "").strip()
+        if not account_id or not name or not re.fullmatch(r"[A-Za-z0-9_-]+", account_id):
+            return None
+
+        if not profile_subdir:
+            profile_subdir = str(Path(ACCOUNT_PROFILE_ROOT.name) / account_id)
+        profile_path = Path(profile_subdir)
+        if profile_path.is_absolute() or ".." in profile_path.parts:
+            return None
+
+        created_at = str(data.get("created_at") or current_timestamp())
+        updated_at = str(data.get("updated_at") or created_at)
+        last_used_at = str(data.get("last_used_at") or "")
+        return cls(account_id, name, profile_subdir, created_at, updated_at, last_used_at)
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "profile_subdir": self.profile_subdir,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "last_used_at": self.last_used_at,
+        }
+
+    def profile_dir(self) -> Path:
+        return APP_DIR / self.profile_subdir
+
+
 class StopRequested(Exception):
     pass
 
 
+def current_timestamp() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def append_run_log(kind: str, message: str) -> None:
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = current_timestamp()
     try:
         with RUN_LOG_FILE.open("a", encoding="utf-8") as file:
             file.write(f"[{timestamp}] [{kind}] {message}\n")
@@ -108,8 +163,15 @@ def append_run_log(kind: str, message: str) -> None:
 
 
 class Gzsk5Exchanger:
-    def __init__(self, log: Callable[[str], None]) -> None:
+    def __init__(
+        self,
+        log: Callable[[str], None],
+        profile_dir: Path,
+        account_name: str,
+    ) -> None:
         self.log = log
+        self.profile_dir = profile_dir
+        self.account_name = account_name
 
     @staticmethod
     def _load_sync_playwright() -> Any:
@@ -121,25 +183,36 @@ class Gzsk5Exchanger:
             ) from exc
         return sync_playwright
 
-    def open_login_page(self) -> None:
+    def open_login_page(self, stop_event: threading.Event | None = None) -> None:
         sync_playwright = self._load_sync_playwright()
         with sync_playwright() as playwright:
             context = self._launch_context(playwright, visible=True)
-            page = self._get_page(context)
-            self.log("已打开网站。如未登录，请在浏览器里完成登录。")
-            token = self._ensure_login(page, interactive=True)
-            self.log(f"已检测到登录态：{token[:6]}***")
-            self.log("登录态已保存，之后可直接调换。")
-            context.close()
+            try:
+                page = self._get_page(context)
+                self.log(f"已打开账号“{self.account_name}”的登录页。")
+                token = self._ensure_login(page, interactive=True, stop_event=stop_event)
+                self.log(f"已检测到登录态：{token[:6]}***")
+                self.log(f"账号“{self.account_name}”登录态已保存，之后可直接调换。")
+            finally:
+                context.close()
 
-    def exchange(self, proxy: ProxyLine, mode: str) -> ProxyLine:
+    def exchange(
+        self,
+        proxy: ProxyLine,
+        mode: str,
+        stop_event: threading.Event | None = None,
+    ) -> ProxyLine:
         sync_playwright = self._load_sync_playwright()
         with sync_playwright() as playwright:
             context = self._launch_context(playwright, visible=(mode != "api"))
-            page = self._get_page(context)
-            token = self._ensure_login(page, interactive=(mode != "api"))
-
             try:
+                page = self._get_page(context)
+                token = self._ensure_login(
+                    page,
+                    interactive=(mode != "api"),
+                    stop_event=stop_event,
+                )
+
                 if mode == "api":
                     result = self._exchange_by_api(page, token, proxy)
                 else:
@@ -160,10 +233,14 @@ class Gzsk5Exchanger:
         sync_playwright = self._load_sync_playwright()
         with sync_playwright() as playwright:
             context = self._launch_context(playwright, visible=(mode != "api"))
-            page = self._get_page(context)
-            token = self._ensure_login(page, interactive=(mode != "api"))
-
             try:
+                page = self._get_page(context)
+                token = self._ensure_login(
+                    page,
+                    interactive=(mode != "api"),
+                    stop_event=stop_event,
+                )
+
                 for index, proxy in enumerate(proxies, start=1):
                     self._raise_if_stopped(stop_event)
                     self._emit_status(on_status, index, "更换中")
@@ -296,10 +373,9 @@ class Gzsk5Exchanger:
         sync_playwright = self._load_sync_playwright()
         with sync_playwright() as playwright:
             context = self._launch_context(playwright, visible=False)
-            page = self._get_page(context)
-            token = self._ensure_login(page, interactive=False)
-
             try:
+                page = self._get_page(context)
+                token = self._ensure_login(page, interactive=False, stop_event=stop_event)
                 exchange_queue: list[ProxyWorkItem] = []
 
                 for index, original in enumerate(proxies, start=1):
@@ -703,13 +779,13 @@ $rows | Sort-Object metric | Select-Object -First 1 | ConvertTo-Json -Compress
         return "，".join(parts)
 
     def _launch_context(self, playwright: Any, visible: bool) -> Any:
-        PROFILE_DIR.mkdir(exist_ok=True)
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
         last_error: Exception | None = None
 
         for channel in ("msedge", "chrome", None):
             try:
                 kwargs: dict[str, Any] = {
-                    "user_data_dir": str(PROFILE_DIR),
+                    "user_data_dir": str(self.profile_dir),
                     "headless": not visible,
                     "viewport": {"width": 1400, "height": 900},
                     "accept_downloads": True,
@@ -732,19 +808,29 @@ $rows | Sort-Object metric | Select-Object -First 1 | ConvertTo-Json -Compress
             return context.pages[0]
         return context.new_page()
 
-    def _ensure_login(self, page: Any, interactive: bool) -> str:
+    def _ensure_login(
+        self,
+        page: Any,
+        interactive: bool,
+        stop_event: threading.Event | None = None,
+    ) -> str:
+        self._raise_if_stopped(stop_event)
         page.goto(SITE_BUY_URL, wait_until="domcontentloaded", timeout=60_000)
         token = self._get_local_storage(page, "api_token")
         if token:
             return token
 
         if not interactive:
-            raise RuntimeError("未检测到登录态。请先点击“首次登录/更新登录态”完成一次登录。")
+            raise RuntimeError(
+                "未检测到当前账号登录态。请先点击“更新当前登录态”，"
+                "或点击“新增账号登录”完成一次登录。"
+            )
 
         deadline = time.time() + LOGIN_WAIT_SECONDS
         told_user = False
 
         while time.time() < deadline:
+            self._raise_if_stopped(stop_event)
             token = self._get_local_storage(page, "api_token")
             if token:
                 return token
@@ -754,7 +840,7 @@ $rows | Sort-Object metric | Select-Object -First 1 | ConvertTo-Json -Compress
                 told_user = True
             time.sleep(1)
 
-        raise TimeoutError("等待登录超时，请重新点击“打开/登录网站”完成登录。")
+        raise TimeoutError("等待登录超时，请重新点击“更新当前登录态”完成登录。")
 
     @staticmethod
     def _get_local_storage(page: Any, key: str) -> str:
@@ -997,6 +1083,11 @@ class App(tk.Tk):
         self.settle_seconds_var = tk.StringVar(value=str(DEFAULT_SETTLE_SECONDS))
         self.bind_local_network_var = tk.BooleanVar(value=True)
         self.local_bind_ip_var = tk.StringVar(value=AUTO_BIND_IP_TEXT)
+        self.account_var = tk.StringVar()
+        self.accounts: list[AccountProfile]
+        self.accounts, self.active_account_id = self._load_accounts()
+        self.account_display_ids: list[str] = []
+        self.refreshing_account_selector = False
         self.worker_running = False
         self.stop_event = threading.Event()
         self.result_items: dict[str, ProxyLine] = {}
@@ -1004,12 +1095,16 @@ class App(tk.Tk):
         self.input_statuses: dict[int, str] = {}
 
         self._load_saved_config()
+        self._ensure_active_account()
         self._build_ui()
+        self._refresh_account_selector()
         self.after(100, self._drain_messages)
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=12)
         root.pack(fill=tk.BOTH, expand=True)
+
+        self._build_account_manager(root)
 
         ttk.Label(root, text="要调换的 IP，一行一条（右侧显示状态）：").pack(anchor=tk.W)
         self._build_input_editor(root)
@@ -1062,10 +1157,6 @@ class App(tk.Tk):
 
         button_frame = ttk.Frame(root)
         button_frame.pack(fill=tk.X, pady=(0, 10))
-        self.login_button = ttk.Button(
-            button_frame, text="首次登录/更新登录态", command=self._start_login
-        )
-        self.login_button.pack(side=tk.LEFT)
         self.exchange_button = ttk.Button(
             button_frame, text="随机调换", command=self._start_exchange
         )
@@ -1098,6 +1189,339 @@ class App(tk.Tk):
         ttk.Label(root, text="运行日志：").pack(anchor=tk.W)
         self.log_text = scrolledtext.ScrolledText(root, height=9, wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+
+    def _build_account_manager(self, parent: ttk.Frame) -> None:
+        account_frame = ttk.LabelFrame(parent, text="账号管理", padding=8)
+        account_frame.pack(fill=tk.X, pady=(0, 10))
+        account_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(account_frame, text="当前使用账号").grid(row=0, column=0, sticky=tk.W)
+        self.account_combo = ttk.Combobox(
+            account_frame,
+            textvariable=self.account_var,
+            state="readonly",
+            width=24,
+        )
+        self.account_combo.grid(row=0, column=1, sticky=tk.EW, padx=(8, 10))
+        self.account_combo.bind("<<ComboboxSelected>>", self._on_account_selected)
+
+        self.switch_account_button = ttk.Button(
+            account_frame, text="新增账号登录", command=self._start_new_account_login
+        )
+        self.switch_account_button.grid(row=0, column=2, sticky=tk.W, padx=(0, 8))
+        self.login_button = ttk.Button(
+            account_frame, text="更新当前登录态", command=self._start_login
+        )
+        self.login_button.grid(row=0, column=3, sticky=tk.W, padx=(0, 8))
+        self.rename_account_button = ttk.Button(
+            account_frame, text="重命名", command=self._rename_active_account
+        )
+        self.rename_account_button.grid(row=0, column=4, sticky=tk.W, padx=(0, 8))
+        self.delete_account_button = ttk.Button(
+            account_frame, text="删除", command=self._delete_active_account
+        )
+        self.delete_account_button.grid(row=0, column=5, sticky=tk.W)
+
+    def _load_accounts(self) -> tuple[list[AccountProfile], str]:
+        accounts: list[AccountProfile] = []
+        active_account_id = ""
+
+        if ACCOUNTS_FILE.exists():
+            try:
+                data = json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+
+            if isinstance(data, dict):
+                active_account_id = str(data.get("active_account_id") or "")
+                raw_accounts = data.get("accounts") or []
+                if isinstance(raw_accounts, list):
+                    seen_ids: set[str] = set()
+                    seen_names: set[str] = set()
+                    for item in raw_accounts:
+                        if not isinstance(item, dict):
+                            continue
+                        account = AccountProfile.from_dict(item)
+                        if account is None:
+                            continue
+                        if account.id in seen_ids or account.name in seen_names:
+                            continue
+                        seen_ids.add(account.id)
+                        seen_names.add(account.name)
+                        accounts.append(account)
+
+        if not accounts:
+            accounts = [self._make_default_account()]
+            active_account_id = accounts[0].id
+            self._write_accounts_file(accounts, active_account_id)
+
+        if active_account_id not in {account.id for account in accounts}:
+            active_account_id = accounts[0].id
+            self._write_accounts_file(accounts, active_account_id)
+
+        return accounts, active_account_id
+
+    @staticmethod
+    def _make_default_account() -> AccountProfile:
+        now = current_timestamp()
+        if LEGACY_PROFILE_DIR.exists():
+            return AccountProfile(
+                id="legacy",
+                name="默认账号",
+                profile_subdir=LEGACY_PROFILE_DIR.name,
+                created_at=now,
+                updated_at=now,
+                last_used_at=now,
+            )
+
+        account_id = uuid.uuid4().hex[:12]
+        return AccountProfile(
+            id=account_id,
+            name="默认账号",
+            profile_subdir=str(Path(ACCOUNT_PROFILE_ROOT.name) / account_id),
+            created_at=now,
+            updated_at=now,
+        )
+
+    def _make_new_account(self, name: str) -> AccountProfile:
+        now = current_timestamp()
+        account_id = uuid.uuid4().hex[:12]
+        return AccountProfile(
+            id=account_id,
+            name=name,
+            profile_subdir=str(Path(ACCOUNT_PROFILE_ROOT.name) / account_id),
+            created_at=now,
+            updated_at=now,
+        )
+
+    @staticmethod
+    def _write_accounts_file(accounts: list[AccountProfile], active_account_id: str) -> None:
+        payload = {
+            "version": 1,
+            "active_account_id": active_account_id,
+            "accounts": [account.to_dict() for account in accounts],
+        }
+        ACCOUNTS_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _save_accounts(self) -> bool:
+        try:
+            self._write_accounts_file(self.accounts, self.active_account_id)
+        except OSError as exc:
+            messagebox.showerror("保存失败", f"无法写入账号配置：{exc}")
+            return False
+        return True
+
+    def _ensure_active_account(self) -> None:
+        if not self.accounts:
+            self.accounts = [self._make_default_account()]
+        if self.active_account_id not in {account.id for account in self.accounts}:
+            self.active_account_id = self.accounts[0].id
+            self._save_accounts()
+
+    def _refresh_account_selector(self) -> None:
+        if not hasattr(self, "account_combo"):
+            return
+
+        self._ensure_active_account()
+        self.refreshing_account_selector = True
+        try:
+            self.account_display_ids = [account.id for account in self.accounts]
+            values = [account.name for account in self.accounts]
+            self.account_combo.configure(values=values)
+            try:
+                index = self.account_display_ids.index(self.active_account_id)
+            except ValueError:
+                index = 0
+                self.active_account_id = self.account_display_ids[0]
+            self.account_combo.current(index)
+            self.account_var.set(values[index])
+        finally:
+            self.refreshing_account_selector = False
+
+    def _on_account_selected(self, _event: Any = None) -> None:
+        if self.refreshing_account_selector:
+            return
+        index = self.account_combo.current()
+        if index < 0 or index >= len(self.account_display_ids):
+            return
+
+        account_id = self.account_display_ids[index]
+        if account_id == self.active_account_id:
+            return
+
+        old_active_account_id = self.active_account_id
+        self.active_account_id = account_id
+        if not self._save_accounts():
+            self.active_account_id = old_active_account_id
+            self._refresh_account_selector()
+            return
+        account = self._get_active_account()
+        if account is not None:
+            self._send_log(f"已切换当前使用账号：{account.name}")
+
+    def _get_active_account(self) -> AccountProfile | None:
+        for account in self.accounts:
+            if account.id == self.active_account_id:
+                return account
+        return self.accounts[0] if self.accounts else None
+
+    def _require_active_account(self) -> AccountProfile | None:
+        account = self._get_active_account()
+        if account is None:
+            messagebox.showerror("账号错误", "请先新增一个账号并完成登录。")
+            return None
+        return account
+
+    def _validate_account_name(self, name: str, current_id: str | None = None) -> str:
+        cleaned = name.strip()
+        if not cleaned:
+            raise ValueError("账号名称不能为空。")
+        if len(cleaned) > 32:
+            raise ValueError("账号名称不能超过 32 个字符。")
+        for account in self.accounts:
+            if account.id != current_id and account.name == cleaned:
+                raise ValueError("账号名称已存在，请换一个名称。")
+        return cleaned
+
+    def _next_account_name(self) -> str:
+        existing = {account.name for account in self.accounts}
+        number = len(self.accounts) + 1
+        while True:
+            name = f"账号 {number}"
+            if name not in existing:
+                return name
+            number += 1
+
+    def _touch_account(self, account_id: str, mark_used: bool = False) -> None:
+        now = current_timestamp()
+        for account in self.accounts:
+            if account.id == account_id:
+                account.updated_at = now
+                if mark_used:
+                    account.last_used_at = now
+                self._save_accounts()
+                return
+
+    def _start_new_account_login(self) -> None:
+        if self.worker_running:
+            messagebox.showinfo("正在运行", "当前任务还没结束，请稍等。")
+            return
+
+        default_name = self._next_account_name()
+        name = simpledialog.askstring(
+            "新增账号",
+            "请输入账号名称：",
+            initialvalue=default_name,
+            parent=self,
+        )
+        if name is None:
+            return
+
+        try:
+            account_name = self._validate_account_name(name)
+        except ValueError as exc:
+            messagebox.showerror("账号名称错误", str(exc))
+            return
+
+        account = self._make_new_account(account_name)
+        self.accounts.append(account)
+        self.active_account_id = account.id
+        if not self._save_accounts():
+            self.accounts.remove(account)
+            self._ensure_active_account()
+            return
+
+        self._refresh_account_selector()
+        self._send_log(f"已新增账号：{account.name}")
+        self._run_worker(lambda exchanger: exchanger.open_login_page(self.stop_event))
+
+    def _rename_active_account(self) -> None:
+        account = self._require_active_account()
+        if account is None:
+            return
+
+        name = simpledialog.askstring(
+            "重命名账号",
+            "请输入新的账号名称：",
+            initialvalue=account.name,
+            parent=self,
+        )
+        if name is None:
+            return
+
+        try:
+            new_name = self._validate_account_name(name, current_id=account.id)
+        except ValueError as exc:
+            messagebox.showerror("账号名称错误", str(exc))
+            return
+
+        if new_name == account.name:
+            return
+
+        old_name = account.name
+        account.name = new_name
+        account.updated_at = current_timestamp()
+        if not self._save_accounts():
+            account.name = old_name
+            return
+
+        self._refresh_account_selector()
+        self._send_log(f"账号已重命名：{old_name} -> {new_name}")
+
+    def _delete_active_account(self) -> None:
+        account = self._require_active_account()
+        if account is None:
+            return
+
+        confirmed = messagebox.askyesno(
+            "删除账号",
+            f"确定删除账号“{account.name}”吗？\n\n该账号保存的登录状态和浏览器缓存也会一起删除。",
+        )
+        if not confirmed:
+            return
+
+        old_accounts = list(self.accounts)
+        old_active = self.active_account_id
+        self.accounts = [item for item in self.accounts if item.id != account.id]
+        self._remove_account_profile(account)
+
+        if not self.accounts:
+            self.accounts = [self._make_default_account()]
+        self.active_account_id = self.accounts[0].id
+
+        if not self._save_accounts():
+            self.accounts = old_accounts
+            self.active_account_id = old_active
+            self._refresh_account_selector()
+            return
+
+        self._refresh_account_selector()
+        self._send_log(f"账号已删除：{account.name}")
+
+    def _remove_account_profile(self, account: AccountProfile) -> None:
+        profile_dir = account.profile_dir()
+        if not profile_dir.exists():
+            return
+
+        try:
+            resolved_profile = profile_dir.resolve()
+            resolved_root = ACCOUNT_PROFILE_ROOT.resolve()
+            resolved_legacy = LEGACY_PROFILE_DIR.resolve()
+            allowed = resolved_profile == resolved_legacy or (
+                resolved_profile != resolved_root
+                and resolved_root in resolved_profile.parents
+            )
+            if not allowed:
+                raise RuntimeError(f"账号目录不在允许范围内：{resolved_profile}")
+            shutil.rmtree(resolved_profile)
+        except Exception as exc:
+            messagebox.showwarning(
+                "账号缓存未完全删除",
+                f"账号记录已删除，但登录缓存目录删除失败：{exc}",
+            )
 
     def _build_input_editor(self, parent: ttk.Frame) -> None:
         input_frame = ttk.Frame(parent)
@@ -1447,7 +1871,7 @@ class App(tk.Tk):
         self._run_worker(task)
 
     def _start_login(self) -> None:
-        self._run_worker(lambda exchanger: exchanger.open_login_page())
+        self._run_worker(lambda exchanger: exchanger.open_login_page(self.stop_event))
 
     def _parse_input_proxies(self) -> list[ProxyLine] | None:
         raw_lines = [
@@ -1720,13 +2144,23 @@ class App(tk.Tk):
             messagebox.showinfo("正在运行", "当前任务还没结束，请稍等。")
             return
 
+        account = self._require_active_account()
+        if account is None:
+            return
+
         self.worker_running = True
         self.stop_event.clear()
+        self._touch_account(account.id, mark_used=True)
         self._set_buttons(False)
 
         def runner() -> None:
-            exchanger = Gzsk5Exchanger(self._send_log)
+            exchanger = Gzsk5Exchanger(
+                self._send_log,
+                account.profile_dir(),
+                account.name,
+            )
             try:
+                self._send_log(f"当前使用账号：{account.name}")
                 task(exchanger)
                 self._send_log("任务完成。")
             except StopRequested:
@@ -1795,6 +2229,10 @@ class App(tk.Tk):
     def _set_buttons(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled else tk.DISABLED
         self.login_button.config(state=state)
+        self.switch_account_button.config(state=state)
+        self.rename_account_button.config(state=state)
+        self.delete_account_button.config(state=state)
+        self.account_combo.config(state="readonly" if enabled else tk.DISABLED)
         self.exchange_button.config(state=state)
         self.qualified_exchange_button.config(state=state)
         self.clear_input_button.config(state=state)

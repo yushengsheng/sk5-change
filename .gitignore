@@ -7,6 +7,8 @@ release/
 *.spec.bak
 
 browser_profile/
+account_profiles/
+ip_exchange_accounts.json
 run_results.log
 launcher_debug.log
 startup_runtime.log
